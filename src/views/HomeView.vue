@@ -4,9 +4,9 @@
       <div class="head">
         <div class="title">Pixi Vue Dispatcher</div>
         <div class="sub">
-          Objects: <b>{{ store.items.length }}</b>
+          Objects: <b>{{ trackers.items.length }}</b>
           <span class="dot">•</span>
-          Visible: <b>{{ store.filtered.length }}</b>
+          Visible: <b>{{ trackers.filtered.length }}</b>
         </div>
       </div>
 
@@ -14,15 +14,15 @@
         <input
           class="input"
           type="text"
-          :value="store.query"
+          :value="trackers.query"
           placeholder="Search by name / id"
-          @input="store.setQuery(($event.target as HTMLInputElement).value)"
+          @input="trackers.setQuery(($event.target as HTMLInputElement).value)"
         />
 
         <select
           class="select"
-          :value="store.status"
-          @change="store.setStatus(($event.target as HTMLSelectElement).value as any)"
+          :value="trackers.status"
+          @change="trackers.setStatus(($event.target as HTMLSelectElement).value as any)"
         >
           <option value="all">All</option>
           <option value="idle">Idle</option>
@@ -30,42 +30,64 @@
           <option value="offline">Offline</option>
         </select>
 
+        <div class="zone">
+          <label class="check">
+            <input
+              type="checkbox"
+              :checked="geozones.enabled"
+              @change="geozones.setEnabled(($event.target as HTMLInputElement).checked)"
+            />
+            <span>Geozones</span>
+          </label>
+
+          <select
+            class="select"
+            :value="geozones.filterId"
+            @change="geozones.setFilterId(($event.target as HTMLSelectElement).value)"
+          >
+            <option value="all">All zones</option>
+            <option v-for="z in geozones.zones" :key="z.id" :value="z.id">{{ z.name }}</option>
+          </select>
+        </div>
+
         <div class="btns">
-          <button class="btn" @click="store.generate(500)">Generate 500</button>
-          <button class="btn" @click="store.generate(2000)">Generate 2000</button>
+          <button class="btn" @click="trackers.generate(500)">Generate 500</button>
+          <button class="btn" @click="trackers.generate(2000)">Generate 2000</button>
         </div>
       </div>
 
-      <div class="selected" v-if="store.selected">
+      <div class="selected" v-if="trackers.selected">
         <div class="row">
           <div class="k">Selected</div>
-          <div class="v">{{ store.selected.name }} ({{ store.selected.id }})</div>
+          <div class="v">{{ trackers.selected.name }} ({{ trackers.selected.id }})</div>
         </div>
         <div class="row">
           <div class="k">Status</div>
-          <div class="v">{{ store.selected.status }}</div>
+          <div class="v">{{ trackers.selected.status }}</div>
         </div>
         <div class="row">
           <div class="k">Battery</div>
-          <div class="v">{{ store.selected.battery }}%</div>
+          <div class="v">{{ trackers.selected.battery }}%</div>
         </div>
         <div class="row">
           <div class="k">Speed</div>
-          <div class="v">{{ store.selected.speed }} km/h</div>
+          <div class="v">{{ trackers.selected.speed }} km/h</div>
         </div>
         <div class="row">
           <div class="k">Position</div>
-          <div class="v">{{ store.selected.x }}, {{ store.selected.y }}</div>
+          <div class="v">{{ trackers.selected.x }}, {{ trackers.selected.y }}</div>
         </div>
+
+        <button class="btn focus" @click="trackers.requestFocus()">Focus on selected</button>
       </div>
 
       <div class="list">
         <div
-          v-for="t in store.list"
+          v-for="t in trackers.list"
           :key="t.id"
           class="item"
-          :class="{ active: t.id === store.selectedId }"
-          @click="store.select(t.id)"
+          :class="{ active: t.id === trackers.selectedId }"
+          @click="trackers.select(t.id)"
         >
           <div class="item-top">
             <span class="name">{{ t.name }}</span>
@@ -92,11 +114,14 @@
 import { onMounted } from 'vue'
 import PixiStage from '@/components/PixiStage.vue'
 import { useTrackersStore } from '@/stores/trackers'
+import { useGeozonesStore } from '@/stores/geozones'
 
-const store = useTrackersStore()
+const trackers = useTrackersStore()
+const geozones = useGeozonesStore()
 
 onMounted(() => {
-  if (!store.items.length) store.generate(800)
+  if (!trackers.items.length) trackers.generate(800)
+  if (!geozones.zones.length) geozones.seed()
 })
 </script>
 
@@ -156,6 +181,20 @@ onMounted(() => {
   outline: none;
 }
 
+.zone {
+  display: grid;
+  gap: 10px;
+}
+
+.check {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  user-select: none;
+  font-size: 13px;
+  color: rgba(255, 255, 255, 0.8);
+}
+
 .btns {
   display: grid;
   grid-template-columns: 1fr 1fr;
@@ -173,6 +212,11 @@ onMounted(() => {
 
 .btn:hover {
   background: rgba(255, 255, 255, 0.1);
+}
+
+.focus {
+  width: 100%;
+  margin-top: 10px;
 }
 
 .selected {

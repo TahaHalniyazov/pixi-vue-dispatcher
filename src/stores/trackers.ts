@@ -23,6 +23,8 @@ export const useTrackersStore = defineStore('trackers', {
     query: '',
     status: 'all' as 'all' | TrackerStatus,
     limitInList: 60,
+    focusRequest: 0,
+    focusId: null as string | null,
   }),
 
   getters: {
@@ -90,6 +92,11 @@ export const useTrackersStore = defineStore('trackers', {
 
     setStatus(v: 'all' | TrackerStatus) {
       this.status = v
+    },
+    requestFocus() {
+      if (!this.selectedId) return
+      this.focusId = this.selectedId
+      this.focusRequest++
     },
   },
 })

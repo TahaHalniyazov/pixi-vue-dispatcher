@@ -16,10 +16,13 @@ import {
   type FederatedPointerEvent,
 } from 'pixi.js'
 import { useTrackersStore } from '@/stores/trackers'
+import { useGeozonesStore } from '@/stores/geozones'
 import type { TrackerStatus } from '@/types/tracker'
+import type { Geozone, Point } from '@/types/geozone'
 
 const host = ref<HTMLDivElement | null>(null)
-const store = useTrackersStore()
+const trackers = useTrackersStore()
+const geozones = useGeozonesStore()
 
 let app: Application | null = null
 let world: Container | null = null
@@ -42,6 +45,16 @@ let tooltipText: Text | null = null
 let hoveredId: string | null = null
 
 let selectionRing: Graphics | null = null
+const zoneGraphicsById = new Map<string, Graphics>()
+
+let cameraTween: null | {
+  t0: number
+  dur: number
+  sx: number
+  sy: number
+  ex: number
+  ey: number
+} = null
 
 function clamp(v: number, min: number, max: number) {
   return Math.max(min, Math.min(max, v))
@@ -218,7 +231,7 @@ function ensureSelectionRing() {
 function syncSelection() {
   if (!selectionRing) return
 
-  const id = store.selectedId
+  const id = trackers.selectedId
   if (!id) {
     selectionRing.visible = false
     return
@@ -238,24 +251,97 @@ function syncSelection() {
   })
 }
 
+function pointInCircle(px: number, py: number, cx: number, cy: number, r: number) {
+  const dx = px - cx
+  const dy = py - cy
+  return dx * dx + dy * dy <= r * r
+}
+
+function pointInPolygon(px: number, py: number, pts: Point[]) {
+  let inside = false
+  for (let i = 0, j = pts.length - 1; i < pts.length; j = i++) {
+    const xi = pts[i].x
+    const yi = pts[i].y
+    const xj = pts[j].x
+    const yj = pts[j].y
+    const intersect = yi > py !== yj > py && px < ((xj - xi) * (py - yi)) / (yj - yi) + xi
+    if (intersect) inside = !inside
+  }
+  return inside
+}
+
+function trackerInZone(tX: number, tY: number, z: Geozone) {
+  if (z.type === 'circle') return pointInCircle(tX, tY, z.x, z.y, z.r)
+  return pointInPolygon(tX, tY, z.points)
+}
+
+function drawGeozones() {
+  if (!geozonesLayer) return
+
+  const keep = new Set(geozones.zones.map((z) => z.id))
+  for (const [id, g] of zoneGraphicsById) {
+    if (!keep.has(id)) {
+      g.destroy()
+      zoneGraphicsById.delete(id)
+    }
+  }
+
+  for (const z of geozones.zones) {
+    let g = zoneGraphicsById.get(z.id)
+    if (!g) {
+      g = new Graphics()
+      zoneGraphicsById.set(z.id, g)
+      geozonesLayer.addChild(g)
+    }
+    g.clear()
+
+    const isSelected = geozones.filterId !== 'all' && geozones.filterId === z.id
+    const color = isSelected ? 0x60a5fa : 0x334155
+    const fill = isSelected ? 0x0b1020 : 0x0b1020
+
+    if (z.type === 'circle') {
+      g.circle(z.x, z.y, z.r).fill({ color: fill, alpha: 0.06 })
+      g.circle(z.x, z.y, z.r).stroke({ width: isSelected ? 3 : 2, color, alpha: 0.9 })
+    } else {
+      g.poly(z.points.map((p) => [p.x, p.y]).flat()).fill({ color: fill, alpha: 0.06 })
+      g.poly(z.points.map((p) => [p.x, p.y]).flat()).stroke({
+        width: isSelected ? 3 : 2,
+        color,
+        alpha: 0.9,
+      })
+    }
+  }
+}
+
 function applyVisibility() {
-  const q = store.query.trim().toLowerCase()
-  const st = store.status
-  for (const t of store.items) {
+  const q = trackers.query.trim().toLowerCase()
+  const st = trackers.status
+  const zonesEnabled = geozones.enabled
+  const zoneSelected = geozones.filterId !== 'all' ? geozones.selected : null
+
+  for (const t of trackers.items) {
     const sprite = spritesById.get(t.id)
     if (!sprite) continue
+
     let ok = true
     if (st !== 'all' && t.status !== st) ok = false
     if (ok && q) ok = t.name.toLowerCase().includes(q) || t.id.toLowerCase().includes(q)
+
+    if (ok && zonesEnabled && zoneSelected) {
+      ok = trackerInZone(t.x, t.y, zoneSelected)
+    }
+
     sprite.visible = ok
+    sprite.alpha = ok ? 1 : 1
   }
-  if (selectionRing?.visible) syncSelection()
+
+  syncSelection()
 }
 
 function upsertTrackers() {
   if (!trackersLayer || !markerTexture) return
 
-  const next = new Set(store.items.map((t) => t.id))
+  const next = new Set(trackers.items.map((t) => t.id))
 
   for (const [id, s] of spritesById) {
     if (!next.has(id)) {
@@ -264,7 +350,7 @@ function upsertTrackers() {
     }
   }
 
-  for (const t of store.items) {
+  for (const t of trackers.items) {
     let s = spritesById.get(t.id)
     if (!s) {
       s = new Sprite(markerTexture)
@@ -285,7 +371,7 @@ function upsertTrackers() {
         if (hoveredId === t.id) hideTooltip()
       })
       s.on('pointertap', () => {
-        store.select(t.id)
+        trackers.select(t.id)
       })
 
       trackersLayer.addChild(s)
@@ -298,6 +384,35 @@ function upsertTrackers() {
 
   applyVisibility()
   syncSelection()
+}
+
+function cameraToWorldPoint(wx: number, wy: number, duration = 280) {
+  if (!app || !world) return
+  const scale = world.scale.x
+  const cx = app.screen.width / 2
+  const cy = app.screen.height / 2
+  const tx = cx - wx * scale
+  const ty = cy - wy * scale
+  cameraTween = {
+    t0: performance.now(),
+    dur: duration,
+    sx: world.position.x,
+    sy: world.position.y,
+    ex: tx,
+    ey: ty,
+  }
+}
+
+function tick(dt: number) {
+  if (!cameraTween || !world) return
+  const now = performance.now()
+  const p = clamp((now - cameraTween.t0) / cameraTween.dur, 0, 1)
+  const t = 1 - Math.pow(1 - p, 3)
+  world.position.set(
+    cameraTween.sx + (cameraTween.ex - cameraTween.sx) * t,
+    cameraTween.sy + (cameraTween.ey - cameraTween.sy) * t,
+  )
+  if (p >= 1) cameraTween = null
 }
 
 onMounted(async () => {
@@ -331,7 +446,7 @@ onMounted(async () => {
   ensureTooltip()
 
   const hud = new Text({
-    text: 'Pan: drag | Zoom: wheel | Select: click tracker',
+    text: 'Pan: drag | Zoom: wheel | Select: click tracker | Focus: button',
     style: { fill: 'white', fontSize: 14 },
   })
   hud.position.set(12, 12)
@@ -350,30 +465,56 @@ onMounted(async () => {
   const onResize = () => setStageHitArea()
   window.addEventListener('resize', onResize)
 
+  app.ticker.add(tick)
+
+  drawGeozones()
   upsertTrackers()
 
   const stopItems = watch(
-    () => store.items,
+    () => trackers.items,
     () => upsertTrackers(),
     { deep: false },
   )
 
   const stopFilters = watch(
-    () => [store.query, store.status],
+    () => [trackers.query, trackers.status, geozones.enabled, geozones.filterId],
     () => applyVisibility(),
   )
 
   const stopSelected = watch(
-    () => store.selectedId,
+    () => trackers.selectedId,
     () => syncSelection(),
+  )
+
+  const stopZones = watch(
+    () => [geozones.zones, geozones.filterId],
+    () => {
+      drawGeozones()
+      applyVisibility()
+    },
+    { deep: true },
+  )
+
+  const stopFocus = watch(
+    () => trackers.focusRequest,
+    () => {
+      const id = trackers.focusId
+      if (!id) return
+      const t = trackers.items.find((x) => x.id === id)
+      if (!t) return
+      cameraToWorldPoint(t.x, t.y, 300)
+    },
   )
 
   onBeforeUnmount(() => {
     window.removeEventListener('resize', onResize)
     detachWheel?.()
+    app?.ticker.remove(tick)
     stopItems()
     stopFilters()
     stopSelected()
+    stopZones()
+    stopFocus()
   })
 })
 
