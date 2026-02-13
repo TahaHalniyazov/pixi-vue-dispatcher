@@ -17,12 +17,19 @@ import {
 } from 'pixi.js'
 import { useTrackersStore } from '@/stores/trackers'
 import { useGeozonesStore } from '@/stores/geozones'
+import { usePlaybackStore } from '@/stores/playback'
 import type { TrackerStatus } from '@/types/tracker'
 import type { Geozone, Point } from '@/types/geozone'
 
 const host = ref<HTMLDivElement | null>(null)
 const trackers = useTrackersStore()
 const geozones = useGeozonesStore()
+const playback = usePlaybackStore()
+
+let dispose: null | (() => void) = null
+
+const MIN_ZOOM = 0.3
+const MAX_ZOOM = 4
 
 let app: Application | null = null
 let world: Container | null = null
@@ -30,22 +37,24 @@ let geozonesLayer: Container | null = null
 let trackersLayer: Container | null = null
 let uiLayer: Container | null = null
 
+let markerTexture: Texture | null = null
+const spritesById = new Map<string, Sprite>()
+const zoneGraphicsById = new Map<string, Graphics>()
+
+let trackLayer: Container | null = null
+let trackLine: Graphics | null = null
+let playbackMarker: Graphics | null = null
+let lastSeg = 0
+let endMarker: Graphics | null = null
 let isDragging = false
 let dragStartScreen = { x: 0, y: 0 }
 let dragStartWorldPos = { x: 0, y: 0 }
-
-const MIN_ZOOM = 0.3
-const MAX_ZOOM = 4
-
-let markerTexture: Texture | null = null
-const spritesById = new Map<string, Sprite>()
 
 let tooltipBox: Graphics | null = null
 let tooltipText: Text | null = null
 let hoveredId: string | null = null
 
 let selectionRing: Graphics | null = null
-const zoneGraphicsById = new Map<string, Graphics>()
 
 let cameraTween: null | {
   t0: number
@@ -90,6 +99,7 @@ function drawWorldGrid() {
     grid.moveTo(x, min).lineTo(x, max)
     grid.stroke({ width: isAxis ? 3 : 1, color: isAxis ? 0x60a5fa : 0x1f2937 })
   }
+
   for (let y = min; y <= max; y += step) {
     const isAxis = y === 0
     grid.moveTo(min, y).lineTo(max, y)
@@ -106,6 +116,7 @@ function drawWorldGrid() {
 
 function zoomAt(screenX: number, screenY: number, factor: number) {
   if (!world) return
+
   const oldScale = world.scale.x
   const newScale = clamp(oldScale * factor, MIN_ZOOM, MAX_ZOOM)
   if (newScale === oldScale) return
@@ -142,9 +153,9 @@ function onPointerUp() {
 }
 
 function attachWheel() {
-  if (!app) return
-  const canvas = app.canvas
+  if (!app) return () => {}
 
+  const canvas = app.canvas
   const onWheel = (ev: WheelEvent) => {
     ev.preventDefault()
     const direction = ev.deltaY > 0 ? -1 : 1
@@ -171,10 +182,7 @@ function ensureTooltip() {
   if (!uiLayer) return
 
   tooltipBox = new Graphics()
-  tooltipText = new Text({
-    text: '',
-    style: { fill: 'white', fontSize: 12 },
-  })
+  tooltipText = new Text({ text: '', style: { fill: 'white', fontSize: 12 } })
 
   tooltipBox.visible = false
   tooltipText.visible = false
@@ -185,6 +193,7 @@ function ensureTooltip() {
 
 function showTooltip(e: FederatedPointerEvent, text: string) {
   if (!tooltipBox || !tooltipText) return
+
   tooltipText.text = text
 
   const padX = 10
@@ -229,7 +238,7 @@ function ensureSelectionRing() {
 }
 
 function syncSelection() {
-  if (!selectionRing) return
+  if (!selectionRing || !trackersLayer) return
 
   const id = trackers.selectedId
   if (!id) {
@@ -238,13 +247,14 @@ function syncSelection() {
   }
 
   const sprite = spritesById.get(id)
-  if (!sprite) {
+  if (!sprite || !sprite.visible) {
     selectionRing.visible = false
     return
   }
 
   selectionRing.visible = true
   selectionRing.position.set(sprite.x, sprite.y)
+  trackersLayer.addChild(selectionRing)
 
   spritesById.forEach((s, sid) => {
     s.scale.set(sid === id ? 1.2 : 1)
@@ -293,22 +303,20 @@ function drawGeozones() {
       zoneGraphicsById.set(z.id, g)
       geozonesLayer.addChild(g)
     }
+
     g.clear()
 
     const isSelected = geozones.filterId !== 'all' && geozones.filterId === z.id
     const color = isSelected ? 0x60a5fa : 0x334155
-    const fill = isSelected ? 0x0b1020 : 0x0b1020
+    const fill = 0x0b1020
 
     if (z.type === 'circle') {
       g.circle(z.x, z.y, z.r).fill({ color: fill, alpha: 0.06 })
       g.circle(z.x, z.y, z.r).stroke({ width: isSelected ? 3 : 2, color, alpha: 0.9 })
     } else {
-      g.poly(z.points.map((p) => [p.x, p.y]).flat()).fill({ color: fill, alpha: 0.06 })
-      g.poly(z.points.map((p) => [p.x, p.y]).flat()).stroke({
-        width: isSelected ? 3 : 2,
-        color,
-        alpha: 0.9,
-      })
+      const flat = z.points.flatMap((p) => [p.x, p.y])
+      g.poly(flat).fill({ color: fill, alpha: 0.06 })
+      g.poly(flat).stroke({ width: isSelected ? 3 : 2, color, alpha: 0.9 })
     }
   }
 }
@@ -326,16 +334,22 @@ function applyVisibility() {
     let ok = true
     if (st !== 'all' && t.status !== st) ok = false
     if (ok && q) ok = t.name.toLowerCase().includes(q) || t.id.toLowerCase().includes(q)
-
-    if (ok && zonesEnabled && zoneSelected) {
-      ok = trackerInZone(t.x, t.y, zoneSelected)
-    }
+    if (ok && zonesEnabled && zoneSelected) ok = trackerInZone(t.x, t.y, zoneSelected)
 
     sprite.visible = ok
-    sprite.alpha = ok ? 1 : 1
+    sprite.alpha = 1
+  }
+
+  if (hoveredId) {
+    const s = spritesById.get(hoveredId)
+    if (!s || !s.visible) hideTooltip()
   }
 
   syncSelection()
+}
+
+function getTrackerSnapshot(id: string) {
+  return trackers.items.find((x) => x.id === id) ?? null
 }
 
 function upsertTrackers() {
@@ -361,17 +375,29 @@ function upsertTrackers() {
       s.cursor = 'pointer'
 
       s.on('pointerover', (e) => {
-        hoveredId = t.id
-        showTooltip(e, `${t.name}\n${t.id}\n${t.status} • ${t.battery}% • ${t.speed} km/h`)
+        const id = s?.name
+        if (!id) return
+        hoveredId = id
+        const snap = getTrackerSnapshot(id)
+        if (!snap) return
+        showTooltip(
+          e,
+          `${snap.name}\n${snap.id}\n${snap.status} • ${snap.battery}% • ${snap.speed} km/h`,
+        )
       })
+
       s.on('pointermove', (e) => {
-        if (hoveredId === t.id) moveTooltip(e)
+        if (hoveredId === s?.name) moveTooltip(e)
       })
+
       s.on('pointerout', () => {
-        if (hoveredId === t.id) hideTooltip()
+        if (hoveredId === s?.name) hideTooltip()
       })
+
       s.on('pointertap', () => {
-        trackers.select(t.id)
+        const id = s?.name
+        if (!id) return
+        trackers.select(id)
       })
 
       trackersLayer.addChild(s)
@@ -386,37 +412,117 @@ function upsertTrackers() {
   syncSelection()
 }
 
+function ensurePlaybackObjects() {
+  if (!trackersLayer) return
+
+  if (!trackLayer) {
+    trackLayer = new Container()
+    trackersLayer.addChildAt(trackLayer, 0)
+  }
+
+  if (!trackLine) {
+    trackLine = new Graphics()
+    trackLayer.addChild(trackLine)
+  }
+
+  if (!playbackMarker) {
+    playbackMarker = new Graphics().circle(0, 0, 9).fill(0xffffff)
+    playbackMarker.stroke({ width: 2, color: 0x60a5fa })
+    playbackMarker.visible = false
+    trackLayer.addChild(playbackMarker)
+  }
+  if (!endMarker) {
+    endMarker = new Graphics().circle(0, 0, 8).stroke({ width: 3, color: 0xf59e0b })
+    endMarker.visible = false
+    trackLayer!.addChild(endMarker)
+  }
+}
+
+function drawTrack() {
+  if (!trackLine) return
+  trackLine.clear()
+
+  const pts = playback.points
+  if (!pts.length) return
+
+  trackLine.moveTo(pts[0].x, pts[0].y)
+  for (let i = 1; i < pts.length; i++) trackLine.lineTo(pts[i].x, pts[i].y)
+
+  trackLine.stroke({ width: 3, color: 0x60a5fa, alpha: 0.6 })
+}
+
+function updatePlaybackMarker() {
+  if (!playbackMarker) return
+
+  const pts = playback.points
+  if (!pts.length) {
+    playbackMarker.visible = false
+    return
+  }
+
+  const t = playback.currentTimeMs
+
+  while (lastSeg < pts.length - 2 && pts[lastSeg + 1].t < t) lastSeg++
+  while (lastSeg > 0 && pts[lastSeg].t > t) lastSeg--
+
+  const a = pts[lastSeg]
+  const b = pts[Math.min(lastSeg + 1, pts.length - 1)]
+
+  const span = Math.max(1, b.t - a.t)
+  const k = Math.max(0, Math.min(1, (t - a.t) / span))
+
+  const x = a.x + (b.x - a.x) * k
+  const y = a.y + (b.y - a.y) * k
+
+  playbackMarker.position.set(x, y)
+  playbackMarker.visible = true
+
+  if (endMarker) {
+    const last = pts[pts.length - 1]
+    endMarker.position.set(last.x, last.y)
+    endMarker.visible = true
+  }
+}
+
 function cameraToWorldPoint(wx: number, wy: number, duration = 280) {
   if (!app || !world) return
   const scale = world.scale.x
   const cx = app.screen.width / 2
   const cy = app.screen.height / 2
-  const tx = cx - wx * scale
-  const ty = cy - wy * scale
   cameraTween = {
     t0: performance.now(),
     dur: duration,
     sx: world.position.x,
     sy: world.position.y,
-    ex: tx,
-    ey: ty,
+    ex: cx - wx * scale,
+    ey: cy - wy * scale,
   }
 }
 
-function tick(dt: number) {
+function tick() {
+  if (!app) return
+
+  playback.stepBy(app.ticker.deltaMS)
+  updatePlaybackMarker()
+
   if (!cameraTween || !world) return
+
   const now = performance.now()
   const p = clamp((now - cameraTween.t0) / cameraTween.dur, 0, 1)
-  const t = 1 - Math.pow(1 - p, 3)
+  const k = 1 - Math.pow(1 - p, 3)
+
   world.position.set(
-    cameraTween.sx + (cameraTween.ex - cameraTween.sx) * t,
-    cameraTween.sy + (cameraTween.ey - cameraTween.sy) * t,
+    cameraTween.sx + (cameraTween.ex - cameraTween.sx) * k,
+    cameraTween.sy + (cameraTween.ey - cameraTween.sy) * k,
   )
+
   if (p >= 1) cameraTween = null
 }
 
 onMounted(async () => {
   if (!host.value) return
+
+  const cleanup: Array<() => void> = []
 
   app = new Application()
   await app.init({
@@ -424,7 +530,6 @@ onMounted(async () => {
     backgroundColor: 0x0b1020,
     antialias: true,
   })
-
   host.value.appendChild(app.canvas)
 
   world = new Container()
@@ -445,6 +550,10 @@ onMounted(async () => {
   ensureSelectionRing()
   ensureTooltip()
 
+  ensurePlaybackObjects()
+  drawTrack()
+  updatePlaybackMarker()
+
   const hud = new Text({
     text: 'Pan: drag | Zoom: wheel | Select: click tracker | Focus: button',
     style: { fill: 'white', fontSize: 14 },
@@ -461,31 +570,24 @@ onMounted(async () => {
   app.stage.on('pointerupoutside', onPointerUp)
 
   const detachWheel = attachWheel()
+  cleanup.push(detachWheel)
 
   const onResize = () => setStageHitArea()
   window.addEventListener('resize', onResize)
+  cleanup.push(() => window.removeEventListener('resize', onResize))
 
   app.ticker.add(tick)
+  cleanup.push(() => app?.ticker.remove(tick))
 
   drawGeozones()
   upsertTrackers()
 
-  const stopItems = watch(
-    () => trackers.items,
-    () => upsertTrackers(),
-    { deep: false },
-  )
-
+  const stopItems = watch(() => trackers.items, upsertTrackers, { deep: false })
   const stopFilters = watch(
     () => [trackers.query, trackers.status, geozones.enabled, geozones.filterId],
-    () => applyVisibility(),
+    applyVisibility,
   )
-
-  const stopSelected = watch(
-    () => trackers.selectedId,
-    () => syncSelection(),
-  )
-
+  const stopSelected = watch(() => trackers.selectedId, syncSelection)
   const stopZones = watch(
     () => [geozones.zones, geozones.filterId],
     () => {
@@ -494,7 +596,6 @@ onMounted(async () => {
     },
     { deep: true },
   )
-
   const stopFocus = watch(
     () => trackers.focusRequest,
     () => {
@@ -506,23 +607,71 @@ onMounted(async () => {
     },
   )
 
-  onBeforeUnmount(() => {
-    window.removeEventListener('resize', onResize)
-    detachWheel?.()
-    app?.ticker.remove(tick)
-    stopItems()
-    stopFilters()
-    stopSelected()
-    stopZones()
-    stopFocus()
-  })
+  const stopPlaybackTrack = watch(
+    () => [playback.trackerId, playback.points.length],
+    () => {
+      lastSeg = 0
+      ensurePlaybackObjects()
+      drawTrack()
+      updatePlaybackMarker()
+    },
+  )
+
+  const stopPlaybackProgress = watch(
+    () => playback.progress,
+    () => updatePlaybackMarker(),
+  )
+
+  cleanup.push(
+    stopItems,
+    stopFilters,
+    stopSelected,
+    stopZones,
+    stopFocus,
+    stopPlaybackTrack,
+    stopPlaybackProgress,
+  )
+
+  dispose = () => {
+    hideTooltip()
+    isDragging = false
+
+    cleanup.reverse().forEach((fn) => fn())
+
+    zoneGraphicsById.forEach((g) => g.destroy())
+    zoneGraphicsById.clear()
+
+    spritesById.forEach((s) => s.destroy())
+    spritesById.clear()
+
+    trackLine?.destroy()
+    playbackMarker?.destroy()
+    trackLayer?.destroy()
+
+    trackLine = null
+    playbackMarker = null
+    trackLayer = null
+
+    markerTexture = null
+    tooltipBox = null
+    tooltipText = null
+    selectionRing = null
+
+    app?.destroy(true)
+    app = null
+
+    world = null
+    geozonesLayer = null
+    trackersLayer = null
+    uiLayer = null
+    endMarker?.destroy()
+    endMarker = null
+  }
 })
 
 onBeforeUnmount(() => {
-  if (app) {
-    app.destroy(true)
-    app = null
-  }
+  dispose?.()
+  dispose = null
 })
 </script>
 
@@ -531,7 +680,8 @@ onBeforeUnmount(() => {
   width: 100%;
   height: 100%;
   min-height: 520px;
-  border-radius: 16px;
+  border-radius: 18px;
   overflow: hidden;
+  box-shadow: 0 18px 60px rgba(0, 0, 0, 0.35);
 }
 </style>
